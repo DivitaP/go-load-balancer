@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Adaptive L7 Load Balancer</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; background:#0d1117; color:#e6edf3;
+         font:14px/1.5 -apple-system, system-ui, sans-serif; padding:24px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:#8b949e; margin-bottom:24px; }
+  .cards { display:flex; gap:16px; flex-wrap:wrap; margin-bottom:24px; }
+  .card { background:#161b22; border:1px solid #30363d; border-radius:8px;
+          padding:16px; min-width:220px; }
+  .card h3 { margin:0 0 12px; font-size:14px; display:flex;
+             align-items:center; gap:8px; }
+  .dot { width:8px; height:8px; border-radius:50%; }
+  .up { background:#3fb950; } .down { background:#f85149; }
+  .row { display:flex; justify-content:space-between; color:#8b949e; }
+  .row b { color:#e6edf3; font-variant-numeric:tabular-nums; }
+  .charts { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  .chart { background:#161b22; border:1px solid #30363d;
+           border-radius:8px; padding:16px; }
+  @media (max-width:900px){ .charts{grid-template-columns:1fr;} }
+</style>
+</head>
+<body>
+<h1>Adaptive Layer 7 Load Balancer</h1>
+<div class="sub">Live backend state, polled every 2s</div>
+<div class="cards" id="cards"></div>
+<div class="charts">
+  <div class="chart"><canvas id="rps"></canvas></div>
+  <div class="chart"><canvas id="latency"></canvas></div>
+</div>
+
+<script>
+const COLORS = ['#58a6ff','#3fb950','#d29922','#f85149','#bc8cff'];
+const opts = (title) => ({
+  responsive: true,
+  animation: false,
+  plugins: {
+    title: { display: true, text: title, color: '#e6edf3' },
+    legend: { labels: { color: '#8b949e' } }
+  },
+  scales: {
+    x: { ticks: { color:'#8b949e' }, grid: { color:'#21262d' } },
+    y: { beginAtZero: true, ticks: { color:'#8b949e' }, grid: { color:'#21262d' } }
+  }
+});
+
+const rps = new Chart(document.getElementById('rps'),
+  { type:'line', data:{labels:[],datasets:[]}, options: opts('Requests/sec') });
+const latency = new Chart(document.getElementById('latency'),
+  { type:'line', data:{labels:[],datasets:[]}, options: opts('Avg latency (ms, EMA)') });
+
+function names(history) {
+  return history.length ? history[history.length-1].backends.map(b => b.backend) : [];
+}
+
+// Counters are cumulative. Prometheus computes rate() at query time;
+// here we do the same thing client-side: delta / elapsed seconds.
+function rateSeries(history, name) {
+  const pts = [];
+  for (let i = 1; i < history.length; i++) {
+    const prev = history[i-1].backends.find(b => b.backend === name);
+    const curr = history[i].backends.find(b => b.backend === name);
+    if (!prev || !curr) { pts.push(0); continue; }
+    const dt = (history[i].ts - history[i-1].ts) / 1000;
+    pts.push(dt > 0 ? Math.max(0, (curr.requests - prev.requests) / dt) : 0);
+  }
+  return pts;
+}
+
+function latencySeries(history, name) {
+  return history.slice(1).map(s => {
+    const b = s.backends.find(x => x.backend === name);
+    return b ? b.latency_ms : 0;
+  });
+}
+
+function updateChart(chart, history, seriesFn) {
+  const labels = history.slice(1).map(s =>
+    new Date(s.ts).toLocaleTimeString([], {minute:'2-digit', second:'2-digit'}));
+  chart.data.labels = labels;
+  chart.data.datasets = names(history).map((n, i) => ({
+    label: n,
+    data: seriesFn(history, n),
+    borderColor: COLORS[i % COLORS.length],
+    backgroundColor: COLORS[i % COLORS.length] + '22',
+    tension: 0.25,
+    pointRadius: 0
+  }));
+  chart.update();
+}
+
+function renderCards(current) {
+  document.getElementById('cards').innerHTML = current.backends.map(b => `
+    <div class="card">
+      <h3><span class="dot ${b.alive ? 'up' : 'down'}"></span>${b.backend}</h3>
+      <div class="row"><span>Status</span><b>${b.alive ? 'UP' : 'DOWN'}</b></div>
+      <div class="row"><span>Weight</span><b>${b.weight}</b></div>
+      <div class="row"><span>Active conns</span><b>${b.active_conns}</b></div>
+      <div class="row"><span>Requests</span><b>${b.requests.toLocaleString()}</b></div>
+      <div class="row"><span>Errors</span><b>${b.errors}</b></div>
+      <div class="row"><span>Latency</span><b>${b.latency_ms.toFixed(2)} ms</b></div>
+    </div>`).join('');
+}
+
+async function poll() {
+  try {
+    const r = await fetch('/api/stats');
+    const { current, history } = await r.json();
+    renderCards(current);
+    if (history.length > 1) {
+      updateChart(rps, history, rateSeries);
+      updateChart(latency, history, latencySeries);
+    }
+  } catch (e) { console.error(e); }
+}
+poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>
